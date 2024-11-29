@@ -4,6 +4,7 @@ import functools
 from collections import namedtuple
 from contextlib import contextmanager
 from queue import Empty
+from time import time
 
 import redis
 from rediscluster.pubsub import ClusterPubSub
@@ -64,6 +65,23 @@ def Mutex(client, name, expire):
 
 
 class QoS(RedisQoS):
+
+    def restore_visible(self, start=0, num=10, interval=10):
+        self._vrestore_count += 1
+        if (self._vrestore_count - 1) % interval:
+            return
+        with self.channel.conn_or_acquire() as client:
+            ceil = time() - self.visibility_timeout
+            try:
+                with Mutex(client, self.unacked_mutex_key,
+                           self.unacked_mutex_expire):
+                    visible = client.zrevrangebyscore(
+                        self.unacked_index_key, ceil, 0,
+                        start=num and start, num=num, withscores=True)
+                    for tag, score in visible or []:
+                        self.restore_by_tag(tag, client)
+            except MutexHeld:
+                pass
 
     def restore_by_tag(self, tag, client=None, leftmost=False):
         with self.channel.conn_or_acquire(client) as client:
