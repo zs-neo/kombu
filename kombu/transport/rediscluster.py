@@ -27,7 +27,7 @@ from ..log import get_logger
 try:
     import rediscluster
     from rediscluster.connection import SSLClusterConnection, ClusterConnection, ClusterConnectionPool
-except ImportError:  # pragma: no cover
+except ImportError:
     rediscluster = None
     ClusterConnection = None
     SSLClusterConnection = None
@@ -43,8 +43,6 @@ DEFAULT_HEALTH_CHECK_INTERVAL = 25
 error_classes_t = namedtuple('error_classes_t', (
     'connection_errors', 'channel_errors',
 ))
-
-PRIORITY_STEPS = [0, 3, 6, 9]
 
 
 @contextmanager
@@ -69,12 +67,15 @@ class QoS(RedisQoS):
 
     def restore_by_tag(self, tag, client=None, leftmost=False):
         with self.channel.conn_or_acquire(client) as client:
+            # Transaction support is disabled in redis-py-cluster.
+            # Use pipelines to avoid extra network round-trips, not to ensure atomicity.
             p = client.hget(self.unacked_key, tag)
             with self.pipe_or_acquire() as pipe:
                 self._remove_from_indices(tag, pipe)
                 if p:
                     M, EX, RK = loads(bytes_to_str(p))  # json is unicode
                     self.channel._do_restore_message(M, EX, RK, pipe, leftmost)
+                pipe.execute()
 
 
 class PrefixedRedisCluster(GlobalKeyPrefixMixin, rediscluster.RedisCluster):
@@ -84,14 +85,14 @@ class PrefixedRedisCluster(GlobalKeyPrefixMixin, rediscluster.RedisCluster):
         rediscluster.RedisCluster.__init__(self, *args, **kwargs)
 
     def pubsub(self, **kwargs):
-        return PrefixedRedisPubSub(
+        return PrefixedRedisClusterPubSub(
             self.connection_pool,
             global_keyprefix=self.global_keyprefix,
             **kwargs,
         )
 
 
-class PrefixedRedisClusterPubSub(rediscluster.pubsub.ClusterPubSub, PrefixedRedisPubSub):
+class PrefixedRedisClusterPubSub(PrefixedRedisPubSub, rediscluster.pubsub.ClusterPubSub):
     pass
 
 
@@ -159,13 +160,19 @@ class ClusterMultiChannelPoller(MultiChannelPoller):
             return self.on_readable(fileno), self
         elif event & ERR:
             chan, conn, type = self._fd_to_chan[fileno]
-            chan._poll_error(type)
+            chan._poll_error(conn, type)
 
 
 class Channel(RedisChannel):
     QoS = QoS
     connection_class = ClusterConnection
     connection_class_ssl = SSLClusterConnection
+
+    min_priority = 0
+    max_priority = 0
+    # Because the keys may be distributed in different slots and each slot may require different connections,
+    # we can not use the brpop command that supports multiple keys in the current framework
+    priority_steps = [min_priority]
 
     def _subscribe(self):
         keys = [self._get_subscribe_topic(queue)
@@ -183,9 +190,7 @@ class Channel(RedisChannel):
         queues = self._queue_cycle.consume(len(self.active_queues))
         if not queues:
             return
-        queues = [self._q_for_pri(queue, pri) for pri in self.priority_steps
-                  for queue in queues]
-        self._in_poll = self.client.connection
+        self._in_poll = True
 
         node_to_keys = {}
         pool = self.client.connection_pool
@@ -255,6 +260,35 @@ class Channel(RedisChannel):
             )
 
         return rediscluster.RedisCluster
+
+    def _poll_error(self, conn, type, **options):
+        if type == 'LISTEN':
+            self.subclient.parse_response()
+        else:
+            self.client.parse_response(conn, type)
+
+    def close(self):
+        self._closing = True
+        if self._in_poll:
+            try:
+                conns = [conn for _, _, conn, _ in self.connection.cycle._chan_to_sock]
+                for conn in conns:
+                    self._brpop_read(**{'conn': conn})
+            except Empty:
+                pass
+        if not self.closed:
+            # remove from channel poller.
+            self.connection.cycle.discard(self)
+
+            # delete fanout bindings
+            client = self.__dict__.get('client')  # only if property cached
+            if client is not None:
+                for queue in self._fanout_queues:
+                    if queue in self.auto_delete_queues:
+                        self.queue_delete(queue, client=client)
+            self._disconnect_pools()
+            self._close_clients()
+        super().close()
 
 
 class Transport(RedisTransport):
