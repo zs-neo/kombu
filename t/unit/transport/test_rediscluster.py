@@ -13,10 +13,10 @@ from kombu.exceptions import VersionMismatch, KeyPrefixNotSupport
 from kombu.utils import eventio
 from kombu.utils.json import dumps
 from kombu import Connection, Producer, Exchange, Queue, Consumer
-from kombu.transport import rediscluster, virtual, redis
 
-pytest.importorskip('redis')
 pytest.importorskip('rediscluster')
+
+from kombu.transport import rediscluster, virtual, redis
 
 from t.unit.transport.test_redis import Client, Pipeline, _poll
 
@@ -1116,7 +1116,7 @@ class test_Redis:
                    transport=Transport).channel()
 
         with pytest.raises(Exception):
-            Connection('redis:///foo').channel()
+            Connection('rediscluster:///foo').channel()
 
     def test_db_port(self):
         c1 = Connection(port=None, transport=Transport).channel()
@@ -1164,7 +1164,7 @@ class test_Redis:
 
     def test_check_at_least_we_try_to_connect_and_fail(self):
         import redis
-        connection = Connection('redis://localhost:65534/')
+        connection = Connection('rediscluster://localhost:65534/')
 
         with pytest.raises(redis.exceptions.ConnectionError):
             chan = connection.channel()
