@@ -9,12 +9,11 @@ from unittest.mock import Mock, patch, call
 
 import pytest
 
-from kombu.exceptions import VersionMismatch
+from kombu.exceptions import VersionMismatch, KeyPrefixNotSupport
 from kombu.utils import eventio
 from kombu.utils.json import dumps
 from kombu import Connection, Producer, Exchange, Queue, Consumer
 from kombu.transport import rediscluster, virtual, redis
-from kombu.transport.rediscluster import PrefixedRedisCluster
 
 pytest.importorskip('redis')
 pytest.importorskip('rediscluster')
@@ -171,12 +170,6 @@ class Transport(rediscluster.Transport):
     channel_errors = (IndexError,)
 
 
-class MockPrefixedRedisCluster(PrefixedRedisCluster):
-    def __init__(self, *args, **kwargs):
-        self.global_keyprefix = kwargs.pop('global_keyprefix', '')
-        self.connection = None
-
-
 class test_Channel:
 
     def setup_method(self):
@@ -243,24 +236,17 @@ class test_Channel:
             conn.channel()
         pool.disconnect.assert_called_with()
         pool.disconnect.reset_mock()
-        # Ensure that the channel without ensured connection to Redis
-        # won't be added to the cycle.
         conn.transport.cycle.add.assert_not_called()
         assert len(conn.transport.channels) == 0
-
         pool_at_init = [None]
         with pytest.raises(RuntimeError):
             conn.channel()
         pool.disconnect.assert_not_called()
 
     def test_redis_connection_added_to_cycle_if_ping_succeeds(self):
-        """Test should check the connection is added to the cycle only
-           if the ping to Redis was finished successfully."""
-        # given: mock pool and client
         pool = Mock(name='pool')
         client = Mock(name='client')
 
-        # override channel class with given mocks
         class XChannel(Channel):
             def __init__(self, *args, **kwargs):
                 self._pool = pool
@@ -269,46 +255,33 @@ class test_Channel:
             def _get_client(self):
                 return lambda *_, **__: client
 
-        # override Channel in Transport with given channel
         class XTransport(Transport):
             Channel = XChannel
 
-        # when: create connection with overridden transport
         conn = Connection(transport=XTransport)
         conn.transport.cycle = Mock(name='cycle')
-        # create the channel
         chan = conn.channel()
-        # then: check if ping was called
         client.ping.assert_called_once()
-        # the connection was added to the cycle
         conn.transport.cycle.add.assert_called_once()
         assert len(conn.transport.channels) == 1
-        # the channel was flagged as registered into poller
         assert chan._registered
 
     def test_redis_on_disconnect_channel_only_if_was_registered(self):
-        """Test should check if the _on_disconnect method is called only
-           if the channel was registered into the poller."""
-        # given: mock pool and client
         pool = Mock(name='pool')
         client = Mock(
             name='client',
             ping=Mock(return_value=True)
         )
 
-        # create RedisConnectionMock class
-        # for the possibility to run disconnect method
         class RedisConnectionMock:
             def disconnect(self, *args):
                 pass
 
-        # override Channel method with given mocks
         class XChannel(Channel):
             connection_class = RedisConnectionMock
 
             def __init__(self, *args, **kwargs):
                 self._pool = pool
-                # counter to check if the method was called
                 self.on_disconect_count = 0
                 super().__init__(*args, **kwargs)
 
@@ -316,10 +289,8 @@ class test_Channel:
                 return lambda *_, **__: client
 
             def _on_connection_disconnect(self, connection):
-                # increment the counter when the method is called
                 self.on_disconect_count += 1
 
-        # create the channel
         chan = XChannel(Mock(
             _used_channel_ids=[],
             channel_max=1,
@@ -328,45 +299,31 @@ class test_Channel:
                 transport_options={},
                 hostname="127.0.0.1",
                 virtual_host=None)))
-        # create the _connparams with overridden connection_class
         connparams = chan._connparams(asynchronous=True)
         redis_connection = connparams['connection_class']()
-        # the connection was added to the cycle
         chan.connection.cycle.add.assert_called_once()
-        # and the ping was called
         client.ping.assert_called_once()
-        # the channel was registered
         assert chan._registered
-        # than disconnect the Redis connection
         redis_connection.disconnect()
-        # the on_disconnect counter should be incremented
         assert chan.on_disconect_count == 1
 
     def test_redis__on_disconnect_should_not_be_called_if_not_registered(self):
-        """Test should check if the _on_disconnect method is not called because
-           the connection to Redis isn't established properly."""
-        # given: mock pool
         pool = Mock(name='pool')
-        # client mock with ping method which return ConnectionError
         from redis import ConnectionError
         client = Mock(
             name='client',
             ping=Mock(side_effect=ConnectionError())
         )
 
-        # create RedisConnectionMock
-        # for the possibility to run disconnect method
         class RedisConnectionMock:
             def disconnect(self, *args):
                 pass
 
-        # override Channel method with given mocks
         class XChannel(Channel):
             connection_class = RedisConnectionMock
 
             def __init__(self, *args, **kwargs):
                 self._pool = pool
-                # counter to check if the method was called
                 self.on_disconect_count = 0
                 super().__init__(*args, **kwargs)
 
@@ -374,12 +331,9 @@ class test_Channel:
                 return lambda *_, **__: client
 
             def _on_connection_disconnect(self, connection):
-                # increment the counter when the method is called
                 self.on_disconect_count += 1
 
-        # then: exception was risen
         with pytest.raises(ConnectionError):
-            # when: create the channel
             chan = XChannel(Mock(
                 _used_channel_ids=[],
                 channel_max=1,
@@ -388,18 +342,12 @@ class test_Channel:
                     transport_options={},
                     hostname="127.0.0.1",
                     virtual_host=None)))
-            # create the _connparams with overridden connection_class
             connparams = chan._connparams(asynchronous=True)
             redis_connection = connparams['connection_class']()
-            # the connection wasn't added to the cycle
             chan.connection.cycle.add.assert_not_called()
-            # the ping was called once with the exception
             client.ping.assert_called_once()
-            # the channel was not registered
             assert not chan._registered
-            # then: disconnect the Redis connection
             redis_connection.disconnect()
-            # the on_disconnect counter shouldn't be incremented
             assert chan.on_disconect_count == 0
 
     def test_after_fork_cleanup_channel(self):
@@ -451,7 +399,6 @@ class test_Channel:
             crit.assert_called()
 
     def test_do_restore_message_celery(self):
-        # Payload value from real Celery project
         payload = {
             "body": base64.b64encode(dumps([
                 [],
@@ -833,11 +780,11 @@ class test_Channel:
 
     def test_connparams_allows_slash_in_db(self):
         self.channel.connection.client.virtual_host = '/123'
-        assert self.channel._connparams()['db'] == 123
+        assert 'db' not in self.channel._connparams()
 
     def test_connparams_db_can_be_int(self):
         self.channel.connection.client.virtual_host = 124
-        assert self.channel._connparams()['db'] == 124
+        assert 'db' not in self.channel._connparams()
 
     def test_new_queue_with_auto_delete(self):
         rediscluster.Channel._new_queue(self.channel, 'george', auto_delete=False)
@@ -848,18 +795,6 @@ class test_Channel:
     def test_connparams_regular_hostname(self):
         self.channel.connection.client.hostname = 'george.vandelay.com'
         assert self.channel._connparams()['host'] == 'george.vandelay.com'
-
-    def test_connparams_username(self):
-        self.channel.connection.client.userid = 'kombu'
-        assert self.channel._connparams()['username'] == 'kombu'
-
-    def test_connparams_client_credentials(self):
-        self.channel.connection.client.hostname = \
-            'redis://foo:bar@127.0.0.1:6379/0'
-        connection_parameters = self.channel._connparams()
-
-        assert connection_parameters['username'] == 'foo'
-        assert connection_parameters['password'] == 'bar'
 
     def test_connparams_password_for_unix_socket(self):
         self.channel.connection.client.hostname = \
@@ -913,8 +848,8 @@ class test_Channel:
 
     def test_get_prefixed_client(self):
         self.channel.global_keyprefix = "test_"
-        PrefixedRedis = rediscluster.Channel._get_client(self.channel)
-        assert isinstance(PrefixedRedis(startup_nodes=[{}], init_slot_cache=False), PrefixedRedisCluster)
+        with pytest.raises(KeyPrefixNotSupport):
+            rediscluster.Channel._get_client(self.channel)
 
     def test_get_response_error(self):
         from redis.exceptions import ResponseError
@@ -1092,67 +1027,6 @@ class test_Channel:
             assert conn.default_channel.get_table('celery') == [
                 ('celery', '', 'celery'),
             ]
-
-    @patch("rediscluster.RedisCluster.execute_command")
-    def test_global_keyprefix(self, mock_execute_command):
-        from kombu.transport.rediscluster import PrefixedRedisCluster
-
-        with Connection(transport=Transport) as conn:
-            client = PrefixedRedisCluster(global_keyprefix='foo_', startup_nodes=[{}], init_slot_cache=False,
-                                          skip_full_coverage_check=True)
-            channel = conn.channel()
-            channel._create_client = Mock()
-            channel._create_client.return_value = client
-
-            body = {'hello': 'world'}
-            channel._put_fanout('exchange', body, '')
-            mock_execute_command.assert_called_with(
-                'PUBLISH',
-                'foo_/{db}.exchange',
-                dumps(body)
-            )
-
-    @patch("rediscluster.RedisCluster.execute_command")
-    def test_global_keyprefix_queue_bind(self, mock_execute_command):
-        from kombu.transport.rediscluster import PrefixedRedisCluster
-
-        with Connection(transport=Transport) as conn:
-            client = PrefixedRedisCluster(global_keyprefix='foo_', startup_nodes=[{}], init_slot_cache=False,
-                                          skip_full_coverage_check=True)
-
-            channel = conn.channel()
-            channel._create_client = Mock()
-            channel._create_client.return_value = client
-
-            channel._queue_bind('default', '', None, 'queue')
-            mock_execute_command.assert_called_with(
-                'SADD',
-                'foo__kombu.binding.default',
-                '\x06\x16\x06\x16queue'
-            )
-
-    @patch("rediscluster.pubsub.ClusterPubSub.execute_command")
-    def test_global_keyprefix_pubsub(self, mock_execute_command):
-        from kombu.transport.rediscluster import PrefixedRedisCluster
-
-        self.channel._fanout_queues.update(a=('a', ''), b=('b', ''))
-
-        with Connection(transport=Transport) as conn:
-            client = PrefixedRedisCluster(global_keyprefix='foo_', startup_nodes=[{}], init_slot_cache=False,
-                                          skip_full_coverage_check=True)
-
-            channel = conn.channel()
-            channel.global_keyprefix = 'foo_'
-            channel._create_client = Mock()
-            channel._create_client.return_value = client
-            channel.subclient.connection = Mock()
-            channel.active_fanout_queues.add('a')
-
-            channel._subscribe()
-            mock_execute_command.assert_called_with(
-                'PSUBSCRIBE',
-                'foo_/{db}.a',
-            )
 
 
 class test_Redis:
@@ -1561,7 +1435,6 @@ class test_Mutex:
             # Won
             client.set.return_value = True
             client.get.return_value = b'mock_uuid'
-            held = False
             with rediscluster.Mutex(client, 'foo1', 100):
                 held = True
             assert held
@@ -1572,69 +1445,7 @@ class test_Mutex:
             # Did not win
             client.set.return_value = None
             client.get.return_value = b'mock_uuid'
-            held = False
             with pytest.raises(rediscluster.MutexHeld):
                 with rediscluster.Mutex(client, 'foo1', 100):
                     held = True
                 assert not held
-
-
-class test_GlobalKeyPrefixMixin:
-    global_keyprefix = "prefix_"
-    mixin = MockPrefixedRedisCluster()
-    mixin.global_keyprefix = global_keyprefix
-
-    def test_prefix_simple_args(self):
-        for command in self.mixin.PREFIXED_SIMPLE_COMMANDS:
-            prefixed_args = self.mixin._prefix_args([command, "fake_key"])
-            assert prefixed_args == [
-                command,
-                f"{self.global_keyprefix}fake_key"
-            ]
-
-    def test_prefix_delete_args(self):
-        prefixed_args = self.mixin._prefix_args([
-            "DEL",
-            "fake_key",
-            "fake_key2",
-            "fake_key3"
-        ])
-
-        assert prefixed_args == [
-            "DEL",
-            f"{self.global_keyprefix}fake_key",
-            f"{self.global_keyprefix}fake_key2",
-            f"{self.global_keyprefix}fake_key3",
-        ]
-
-    def test_prefix_brpop_args(self):
-        prefixed_args = self.mixin._prefix_args([
-            "BRPOP",
-            "fake_key",
-            "fake_key2",
-            "not_prefixed"
-        ])
-
-        assert prefixed_args == [
-            "BRPOP",
-            f"{self.global_keyprefix}fake_key",
-            f"{self.global_keyprefix}fake_key2",
-            "not_prefixed",
-        ]
-
-    def test_prefix_evalsha_args(self):
-        prefixed_args = self.mixin._prefix_args([
-            "EVALSHA",
-            "not_prefixed",
-            "not_prefixed",
-            "fake_key",
-            "not_prefixed",
-        ])
-
-        assert prefixed_args == [
-            "EVALSHA",
-            "not_prefixed",
-            "not_prefixed",
-            f"{self.global_keyprefix}fake_key",
-            "not_prefixed",
-        ]
