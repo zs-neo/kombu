@@ -161,18 +161,6 @@ class Channel(RedisChannel):
         connparams['skip_full_coverage_check'] = True
         return connparams
 
-    def _subscribe(self):
-        keys = [self._get_subscribe_topic(queue)
-                for queue in self.active_fanout_queues]
-        if not keys:
-            return
-        c = self.subclient
-        self._in_listen = True
-        if c.connection._sock is None:
-            c.connection.connect()
-        self._in_listen = c.connection
-        c.psubscribe(keys)
-
     def _brpop_start(self, timeout=1):
         queues = self._queue_cycle.consume(len(self.active_queues))
         if not queues:
@@ -259,9 +247,9 @@ class Channel(RedisChannel):
         self._closing = True
         if self._in_poll:
             try:
-                conns = [conn for _, _, conn, _ in self.connection.cycle._chan_to_sock]
-                for conn in conns:
-                    self._brpop_read(**{'conn': conn})
+                for channel, _, conn, _ in self.connection.cycle._chan_to_sock:
+                    if channel == self:
+                        self._brpop_read(**{'conn': conn})
             except Empty:
                 pass
         if not self.closed:
